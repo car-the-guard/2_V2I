@@ -7,14 +7,14 @@
 #include "types.h"
 #include "timeutil.h"
 #include "packet.h"
-#include "security.h" // [추가] 패킷 Wrap 함수 사용
+#include "security.h" 
 
 // ---- 사고 테이블(간단 버전) ----
 typedef struct {
-  uint64_t accident_id;     // [변경] uint32 -> uint64 (패킷 정의에 맞춤)
+  uint64_t accident_id;     
   bool active;
   uint64_t expire_ms;
-  rsu3_payload_t last_rsu3; // [변경] rsu3p_msg_t -> rsu3_payload_t
+  rsu3_payload_t last_rsu3; 
 } acc_ent_t;
 
 // ---- 2초 tick 이벤트를 SM 큐로 넣는 타이머 콜백 ----
@@ -22,7 +22,7 @@ static void post_tick_event(void *arg) {
   bq_t *q = (bq_t*)arg;
   sm_event_t *ev = (sm_event_t*)calloc(1, sizeof(*ev));
   if (!ev) return;
-  ev->type = EV_TIMER_2S_TICK;
+  ev->type = EV_TIMER_TICK; // [수정] 오타 수정 (2S 제거)
   (void)bq_push(q, ev);
 }
 
@@ -49,24 +49,21 @@ static void* sm_thread(void *arg) {
     uint64_t now = now_ms_monotonic();
 
     // 1. [WL-1 수신] -> RSU-2' -> 서버 전송 큐로 전달
-    if (ev->type == EV_WL1_RX) {  // [변경] 이벤트 명
-      // TODO: dedup 키 설계/중복관리 추가 가능
-      tx_cmd_wired_t *cmd = (tx_cmd_wired_t*)calloc(1, sizeof(*cmd)); // [변경] tx_cmd_t -> tx_cmd_wired_t
+    if (ev->type == EV_WL1_RX) {
+      tx_cmd_wired_t *cmd = (tx_cmd_wired_t*)calloc(1, sizeof(*cmd)); 
       if (cmd) {
         cmd->rsu2p = ev->u.rsu2p;  // ownership 이동
-        // msg_id 등은 필요시 wired_client 내부나 여기서 관리
         (void)bq_push(sm->to_tx_cmd_q, cmd);
       } else {
         free(ev->u.rsu2p);
       }
     }
     // 2. [서버(RSU-3) 수신] -> RSU-3' -> 사고 테이블 갱신
-    else if (ev->type == EV_RSU3_RX) { // [변경] 이벤트 명
+    else if (ev->type == EV_RSU3_RX) {
       rsu3_payload_t *r = ev->u.rsu3p;
 
       int idx = -1;
       for (int i = 0; i < n; i++) {
-        // [변경] 구조체 필드 경로 수정 (r->accident.accident_id)
         if (table[i].accident_id == r->accident.accident_id) { idx = i; break; }
       }
       if (idx < 0 && n < 256) {
@@ -75,12 +72,10 @@ static void* sm_thread(void *arg) {
       }
 
       if (idx >= 0) {
-        // [변경] acc_flag 확인 (0이면 Off, 그 외 On)
         table[idx].active = (r->server_info.acc_flag != 0);
-        table[idx].expire_ms = now + 15000; // 15초 타임아웃 갱신
-        table[idx].last_rsu3 = *r;          // 최신 정보 저장
+        table[idx].expire_ms = now + 15000; 
+        table[idx].last_rsu3 = *r;          
 
-        // LED on/off (active인 사고가 하나라도 있으면 on)
         if (sm->led) {
           bool any_active = false;
           for (int i = 0; i < n; i++) if (table[i].active) { any_active = true; break; }
@@ -90,8 +85,7 @@ static void* sm_thread(void *arg) {
       free(r);
     }
     // 3. [2초 타이머] -> Active 사고 무선 송신 (WL-1/RSU-1)
-    else if (ev->type == EV_TIMER_2S_TICK) {
-      // active 사고들에 대해 RSU-1 패킷을 만들어 무선 TX 큐로 push
+    else if (ev->type == EV_TIMER_TICK) { // [수정] 오타 수정
       for (int i = 0; i < n; i++) {
         if (!table[i].active) continue;
 
@@ -121,7 +115,7 @@ static void* sm_thread(void *arg) {
       // 다음 tick 예약
       schedule_next_2s(sm->sched, sm->in_ev_q);
 
-      // LED 상태 재평가(만료로 active가 줄었을 수 있음)
+      // LED 상태 재평가
       if (sm->led) {
         bool any_active = false;
         for (int i = 0; i < n; i++) if (table[i].active) { any_active = true; break; }

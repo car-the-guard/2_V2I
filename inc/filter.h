@@ -20,4 +20,4 @@ void filter_init(filter_ctx_t *ctx, uint32_t rsu_id);
  * light + heavy 모두 통과하면 true.
  * out_dist_m: (필요시) 사고-현재RSU 거리 산출 (지금은 스텁)
  */
-bool filter_pass_all(const filter_ctx_t *ctx, const wl1_msg_t *m, uint32_t *out_dist_m);
+bool filter_pass_all(const void *raw_pkt, uint32_t rsu_id, uint32_t *out_dist_m);

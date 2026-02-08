@@ -111,5 +111,3 @@ typedef struct {
 typedef struct {
     rsu2_payload_t *rsu2p; // 아직 Token 안 붙은 것
 } tx_cmd_wired_t;
-
-#endif // types.h 중복 방지 (pragma once 사용 시 생략 가능)

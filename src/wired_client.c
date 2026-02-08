@@ -1,5 +1,5 @@
-// io/wired_client.c
 #include "wired_client.h"
+#include "security.h"  // [필수] 보안 함수 사용을 위해 추가
 #include "log.h"
 #include "timeutil.h"
 #include <arpa/inet.h>
@@ -10,13 +10,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-// 간단 pending 엔트리 (스텁)
+// 간단 pending 엔트리 (재전송 관리용)
 typedef struct {
   bool used;
   uint32_t msg_id;
   uint64_t sent_ms;
   int retry;
-  tx_cmd_t *cmd; // 재전송용 보관
+  tx_cmd_wired_t *cmd; // [수정] tx_cmd_t -> tx_cmd_wired_t (타입명 변경 반영)
 } pending_t;
 
 static int tcp_connect_bind(const app_config_t *cfg) {
@@ -34,7 +34,6 @@ static int tcp_connect_bind(const app_config_t *cfg) {
   local.sin_addr.s_addr = inet_addr("0.0.0.0");
   if (bind(s, (struct sockaddr*)&local, sizeof(local)) < 0) {
     LOGW("tcp bind local failed: %d", errno);
-    // bind 실패해도 진행 가능한 환경도 있음(포트 점유 등) -> 여기서는 실패로 둠
     close(s);
     return -1;
   }
@@ -53,22 +52,28 @@ static int tcp_connect_bind(const app_config_t *cfg) {
   return s;
 }
 
-// RX thread: (스텁) ACK / RSU-3 수신 파싱 자리
+// RX thread: RSU-3(Packet) 수신 -> Strip -> RSU-3'(Payload)
 static void* tcp_rx_thread(void *arg) {
     wired_client_t *wc = (wired_client_t*)arg;
+    wc->running = true;
+
     uint8_t buf[256];
 
     while (wc->running) {
         // RSU-3 Packet Size (64 Bytes) 수신
         ssize_t n = recv(wc->sock, buf, sizeof(rsu3_packet_t), MSG_WAITALL);
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (errno == EINTR) continue;
+            LOGW("tcp recv end/err: %d", errno);
+            break;
+        }
 
         if (n != sizeof(rsu3_packet_t)) continue;
 
         const rsu3_packet_t *pkt = (rsu3_packet_t*)buf;
         
         // [RX Strip] RSU-3 -> RSU-3'
-        rsu3_payload_t *payload = calloc(1, sizeof(rsu3_payload_t));
+        rsu3_payload_t *payload = (rsu3_payload_t*)calloc(1, sizeof(rsu3_payload_t));
         if (sec_wired_rx_strip(pkt, payload)) {
             bq_push(wc->rsu3_out_q, payload);
         } else {
@@ -78,12 +83,16 @@ static void* tcp_rx_thread(void *arg) {
     return NULL;
 }
 
-// TxManager: send + pending + timeout 재전송 (단일 스레드)
+// TxManager: RSU-2'(Payload) -> Wrap -> RSU-2(Packet) -> Send
 static void* tcp_tx_manager_thread(void *arg) {
     wired_client_t *wc = (wired_client_t*)arg;
-    
+
+    // pending 로직은 간단히 유지 (ACK 처리는 일단 스텁)
+    pending_t pend[64];
+    memset(pend, 0, sizeof(pend));
+
     while (wc->running) {
-        // StateManager가 보낸 RSU-2'(Payload)
+        // StateManager가 보낸 RSU-2'(Payload) 가져오기
         tx_cmd_wired_t *cmd = (tx_cmd_wired_t*)bq_pop(wc->tx_cmd_q);
         if (!cmd) {
             if (!wc->running) break;
@@ -93,6 +102,8 @@ static void* tcp_tx_manager_thread(void *arg) {
         if (cmd->rsu2p) {
             // [TX Wrap] RSU-2' -> RSU-2
             rsu2_packet_t pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            
             if (sec_wired_tx_wrap(cmd->rsu2p, &pkt)) {
                 send(wc->sock, &pkt, sizeof(pkt), 0);
             }
