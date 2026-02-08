@@ -10,75 +10,60 @@
 #include "security.h"
 #include "packet.h"
 
+// WL-1 Worker: [Raw Q] -> [Filter] -> [Strip] -> [Packet Conv] -> [SM Event Q]
 static void* wl1_worker_thread(void *arg) {
-  pipeline_t *p = (pipeline_t*)arg;
+    pipeline_t *p = (pipeline_t*)arg;
 
-  filter_ctx_t fctx;
-  filter_init(&fctx, p->cfg.rsu_id);
+    while (p->running) {
+        wl1_packet_t *pkt = (wl1_packet_t*)bq_pop(&p->Q_wl1_raw);
+        if (!pkt) break;
 
-  while (p->running) {
-    wl1_msg_t *m = (wl1_msg_t*)bq_pop(&p->Q_wl1_raw);
-    if (!m) break;
+        uint32_t dist = 0;
+        // 1. Filter (Raw Packet 검사)
+        if (!filter_pass_all(pkt, p->cfg.rsu_id, &dist)) {
+            free(pkt);
+            continue;
+        }
 
-    uint32_t dist_m = 0;
-    if (!filter_pass_all(&fctx, m, &dist_m)) {
-      free(m);
-      continue;
+        // 2. Wireless RX Strip (Packet -> Payload)
+        wl1_payload_t stripped;
+        if (!sec_wireless_rx_strip(pkt, &stripped)) {
+            free(pkt);
+            continue;
+        }
+
+        // 3. Packet Convert (WL-1' -> RSU-2')
+        rsu2_payload_t *rsu2p = calloc(1, sizeof(rsu2_payload_t));
+        if (!packet_wl1_to_rsu2(&stripped, p->cfg.rsu_id, dist, rsu2p)) {
+            free(rsu2p);
+            free(pkt);
+            continue;
+        }
+
+        // 4. Send to StateManager
+        sm_event_t *ev = calloc(1, sizeof(sm_event_t));
+        ev->type = EV_WL1_RX;
+        ev->u.rsu2p = rsu2p;
+        bq_push(&p->Q_sm_events, ev);
+
+        free(pkt);
     }
-
-    wl1_msg_t stripped;
-    if (!security_wireless_verify_and_strip(m, &stripped)) {
-      free(m);
-      continue;
-    }
-
-    rsu2p_msg_t *rsu2p = (rsu2p_msg_t*)calloc(1, sizeof(*rsu2p));
-    if (!rsu2p) {
-      free(m);
-      continue;
-    }
-
-    if (!packet_build_rsu2p_from_wl1(p->cfg.rsu_id, &stripped, dist_m, rsu2p)) {
-      free(rsu2p);
-      free(m);
-      continue;
-    }
-
-    sm_event_t *ev = (sm_event_t*)calloc(1, sizeof(*ev));
-    if (!ev) {
-      free(rsu2p);
-      free(m);
-      continue;
-    }
-    ev->type = EV_FROM_WL1_RSU2P;
-    ev->u.rsu2p = rsu2p;
-
-    (void)bq_push(&p->Q_sm_events, ev);
-
-    free(m);
-  }
-
-  return NULL;
+    return NULL;
 }
 
+// RSU-3 Dispatch: [RSU-3 Q] -> [SM Event Q]
 static void* rsu3_dispatch_thread(void *arg) {
-  pipeline_t *p = (pipeline_t*)arg;
+    pipeline_t *p = (pipeline_t*)arg;
+    while (p->running) {
+        rsu3_payload_t *r = (rsu3_payload_t*)bq_pop(&p->Q_rsu3_in);
+        if (!r) break;
 
-  while (p->running) {
-    rsu3p_msg_t *r = (rsu3p_msg_t*)bq_pop(&p->Q_rsu3_in);
-    if (!r) break;
-
-    sm_event_t *ev = (sm_event_t*)calloc(1, sizeof(*ev));
-    if (!ev) {
-      free(r);
-      continue;
+        sm_event_t *ev = calloc(1, sizeof(sm_event_t));
+        ev->type = EV_RSU3_RX;
+        ev->u.rsu3p = r;
+        bq_push(&p->Q_sm_events, ev);
     }
-    ev->type = EV_FROM_SERVER_RSU3P;
-    ev->u.rsu3p = r;
-
-    (void)bq_push(&p->Q_sm_events, ev);
-  }
-  return NULL;
+    return NULL;
 }
 
 int pipeline_start(pipeline_t *p) {

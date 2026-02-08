@@ -22,76 +22,60 @@
 #endif
 
 static void* wireless_rx_thread(void *arg) {
-  wireless_t *w = (wireless_t*)arg;
+    wireless_t *w = (wireless_t*)arg;
+    uint8_t buf[512]; // 충분한 크기
 
-  while (w->running) {
-    uint8_t buf[256];
-    struct sockaddr_in src;
-    socklen_t slen = sizeof(src);
+    while (w->running) {
+        struct sockaddr_in src;
+        socklen_t slen = sizeof(src);
+        ssize_t n = recvfrom(w->sock_rx, buf, sizeof(buf), 0, (struct sockaddr*)&src, &slen);
+        
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            continue;
+        }
+        
+        // WL-1 Packet Size Check (256 Bytes)
+        if (n != sizeof(wl1_packet_t)) {
+            // LOGW("Invalid WL-1 size: %ld", n);
+            continue;
+        }
 
-    ssize_t n = recvfrom(w->sock_rx, buf, sizeof(buf), 0, (struct sockaddr*)&src, &slen);
-    if (n < 0) {
-      if (!w->running) break;
-      if (errno == EINTR) continue;
-      LOGW("wireless rx recvfrom failed: errno=%d", errno);
-      continue;
+        // Raw Packet을 그대로 큐에 복사해서 넣음
+        // (필터/보안은 Pipeline Worker가 수행)
+        wl1_packet_t *pkt = calloc(1, sizeof(wl1_packet_t));
+        memcpy(pkt, buf, sizeof(wl1_packet_t));
+        
+        if (!bq_push(w->out_rx_q, pkt)) {
+            free(pkt);
+        }
     }
-    if (n != 256) {
-      // length 체크
-      continue;
-    }
-
-    wl1_msg_t *m = (wl1_msg_t*)calloc(1, sizeof(*m));
-    if (!m) continue;
-
-    memcpy(m->raw, buf, 256);
-    m->rx_ms = now_ms_monotonic();
-
-    // TODO: 실제 WL-1 파싱 로직 (ttl/ver/msg_type/accident_id/...)
-    // 스텁 값
-    m->ttl = 3;
-    m->ver = 1;
-    m->msg_type = 0;
-    m->accident_id = 1001;
-    m->sender_id = 0xABC00001;
-    m->severity = 3;
-    m->direction = 1;
-    m->lat = 37.0;
-    m->lon = 127.0;
-
-    if (!bq_push(w->out_rx_q, m)) {
-      free(m);
-    }
-  }
-
-  return NULL;
+    return NULL;
 }
 
 static void* wireless_tx_thread(void *arg) {
-  wireless_t *w = (wireless_t*)arg;
+    wireless_t *w = (wireless_t*)arg;
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(30001); // TODO: Config
+    dst.sin_addr.s_addr = inet_addr("255.255.255.255");
+    
+    int yes=1;
+    setsockopt(w->sock_tx, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
 
-  struct sockaddr_in dst;
-  memset(&dst, 0, sizeof(dst));
-  dst.sin_family = AF_INET;
-  dst.sin_port = htons(WL1_TX_PORT);
-  dst.sin_addr.s_addr = inet_addr(WL1_TX_BCAST_IP);
+    while (w->running) {
+        // 이미 Wrap된 wl1_packet_t(256B)가 넘어옴
+        wl1_packet_t *pkt = (wl1_packet_t*)bq_pop(w->in_tx_q);
+        if (!pkt) {
+            if (!w->running) break;
+            continue;
+        }
 
-  int yes = 1;
-  setsockopt(w->sock_tx, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
-
-  while (w->running) {
-    uint8_t *pkt = (uint8_t*)bq_pop(w->in_tx_q);
-    if (!pkt) {
-      // queue가 stop되면 NULL 가능
-      if (!w->running) break;
-      continue;
+        sendto(w->sock_tx, pkt, sizeof(wl1_packet_t), 0, (struct sockaddr*)&dst, sizeof(dst));
+        free(pkt);
     }
-
-    (void)sendto(w->sock_tx, pkt, 256, 0, (struct sockaddr*)&dst, sizeof(dst));
-    free(pkt);
-  }
-
-  return NULL;
+    return NULL;
 }
 
 int wireless_start(wireless_t *w, const app_config_t *cfg, bq_t *out_rx_q, bq_t *in_tx_q) {

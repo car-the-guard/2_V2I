@@ -1,21 +1,16 @@
 #pragma once
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 #include "types.h"
 
-/*
- * security.c는 sec_wireless + sec_wired를 묶은 모듈.
- * 지금은 스텁(그대로 통과)이고, 나중에 실제 서명검증/부착 구현.
- */
+// 무선: RX Strip (Packet -> Payload)
+bool sec_wireless_rx_strip(const wl1_packet_t *pkt, wl1_payload_t *out_payload);
 
-// 무선: 서명 검증 후 보안부 제거(또는 strip)된 데이터로 out_stripped 채움
-bool security_wireless_verify_and_strip(const wl1_msg_t *in,
-                                        wl1_msg_t *out_stripped);
+// 무선: TX Wrap (Payload -> Packet)
+bool sec_wireless_tx_wrap(const wl1_payload_t *in_payload, wl1_packet_t *out_pkt);
 
-// 유선: wrap/unwrap (보안헤더/서명 부착, 검증/제거)
-bool security_wired_wrap(const uint8_t *in, size_t in_len,
-                         uint8_t *out, size_t *out_len, size_t out_cap);
+// 유선: RX Strip (RSU-3 Packet -> Payload)
+bool sec_wired_rx_strip(const rsu3_packet_t *pkt, rsu3_payload_t *out_payload);
 
-bool security_wired_unwrap(const uint8_t *in, size_t in_len,
-                           uint8_t *out, size_t *out_len, size_t out_cap);
+// 유선: TX Wrap (RSU-2 Payload -> Packet)
+bool sec_wired_tx_wrap(const rsu2_payload_t *in_payload, rsu2_packet_t *out_pkt);

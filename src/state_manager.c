@@ -7,13 +7,14 @@
 #include "types.h"
 #include "timeutil.h"
 #include "packet.h"
+#include "security.h" // [추가] 패킷 Wrap 함수 사용
 
 // ---- 사고 테이블(간단 버전) ----
 typedef struct {
-  uint32_t accident_id;
+  uint64_t accident_id;     // [변경] uint32 -> uint64 (패킷 정의에 맞춤)
   bool active;
   uint64_t expire_ms;
-  rsu3p_msg_t last_rsu3;
+  rsu3_payload_t last_rsu3; // [변경] rsu3p_msg_t -> rsu3_payload_t
 } acc_ent_t;
 
 // ---- 2초 tick 이벤트를 SM 큐로 넣는 타이머 콜백 ----
@@ -47,37 +48,39 @@ static void* sm_thread(void *arg) {
 
     uint64_t now = now_ms_monotonic();
 
-    if (ev->type == EV_FROM_WL1_RSU2P) {
-      // WL-1 -> RSU-2' 들어온 이벤트
+    // 1. [WL-1 수신] -> RSU-2' -> 서버 전송 큐로 전달
+    if (ev->type == EV_WL1_RX) {  // [변경] 이벤트 명
       // TODO: dedup 키 설계/중복관리 추가 가능
-      tx_cmd_t *cmd = (tx_cmd_t*)calloc(1, sizeof(*cmd));
+      tx_cmd_wired_t *cmd = (tx_cmd_wired_t*)calloc(1, sizeof(*cmd)); // [변경] tx_cmd_t -> tx_cmd_wired_t
       if (cmd) {
         cmd->rsu2p = ev->u.rsu2p;  // ownership 이동
-        cmd->msg_id = 1;          // TODO: 증가 카운터로 교체
+        // msg_id 등은 필요시 wired_client 내부나 여기서 관리
         (void)bq_push(sm->to_tx_cmd_q, cmd);
       } else {
         free(ev->u.rsu2p);
       }
     }
-    else if (ev->type == EV_FROM_SERVER_RSU3P) {
-      // 서버 -> RSU-3' 들어온 이벤트
-      rsu3p_msg_t *r = ev->u.rsu3p;
+    // 2. [서버(RSU-3) 수신] -> RSU-3' -> 사고 테이블 갱신
+    else if (ev->type == EV_RSU3_RX) { // [변경] 이벤트 명
+      rsu3_payload_t *r = ev->u.rsu3p;
 
       int idx = -1;
       for (int i = 0; i < n; i++) {
-        if (table[i].accident_id == r->accident_id) { idx = i; break; }
+        // [변경] 구조체 필드 경로 수정 (r->accident.accident_id)
+        if (table[i].accident_id == r->accident.accident_id) { idx = i; break; }
       }
       if (idx < 0 && n < 256) {
         idx = n++;
-        table[idx].accident_id = r->accident_id;
+        table[idx].accident_id = r->accident.accident_id;
       }
 
       if (idx >= 0) {
-        table[idx].active = (r->cmd_onoff == 1);
-        table[idx].expire_ms = now + 15000; // TODO: 정책에 맞게 갱신
-        table[idx].last_rsu3 = *r;
+        // [변경] acc_flag 확인 (0이면 Off, 그 외 On)
+        table[idx].active = (r->server_info.acc_flag != 0);
+        table[idx].expire_ms = now + 15000; // 15초 타임아웃 갱신
+        table[idx].last_rsu3 = *r;          // 최신 정보 저장
 
-        // LED on/off (간단 정책: active인 사고가 하나라도 있으면 on)
+        // LED on/off (active인 사고가 하나라도 있으면 on)
         if (sm->led) {
           bool any_active = false;
           for (int i = 0; i < n; i++) if (table[i].active) { any_active = true; break; }
@@ -86,6 +89,7 @@ static void* sm_thread(void *arg) {
       }
       free(r);
     }
+    // 3. [2초 타이머] -> Active 사고 무선 송신 (WL-1/RSU-1)
     else if (ev->type == EV_TIMER_2S_TICK) {
       // active 사고들에 대해 RSU-1 패킷을 만들어 무선 TX 큐로 push
       for (int i = 0; i < n; i++) {
@@ -96,12 +100,19 @@ static void* sm_thread(void *arg) {
           continue;
         }
 
-        uint8_t *pkt = (uint8_t*)calloc(1, 256);
+        // 3-1. RSU-3' -> WL-1' (Payload 변환)
+        wl1_payload_t wl1p;
+        if (!packet_rsu3_to_wl1(&table[i].last_rsu3, &wl1p)) {
+          continue;
+        }
+
+        // 3-2. WL-1' -> WL-1 Packet (보안 Wrap)
+        wl1_packet_t *pkt = (wl1_packet_t*)calloc(1, sizeof(wl1_packet_t));
         if (!pkt) continue;
 
-        if (!packet_build_rsu1_wireless_payload(&table[i].last_rsu3, pkt)) {
-          free(pkt);
-          continue;
+        if (!sec_wireless_tx_wrap(&wl1p, pkt)) {
+            free(pkt);
+            continue;
         }
 
         (void)bq_push(sm->to_air_q, pkt);
