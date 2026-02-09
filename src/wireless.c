@@ -29,7 +29,10 @@ static void* wireless_rx_thread(void *arg) {
         struct sockaddr_in src;
         socklen_t slen = sizeof(src);
         ssize_t n = recvfrom(w->sock_rx, buf, sizeof(buf), 0, (struct sockaddr*)&src, &slen);
-        
+        if (n > 0) {
+            // 패킷 수신 시점 기록
+            LOGI("[STEP 1] UDP RX Packet: %ld bytes", n);
+        }
         if (n < 0) {
             if (errno == EINTR) continue;
             continue;

@@ -1,6 +1,7 @@
 #include "wired_client.h"
-#include "security.h"  // [필수] 보안 함수 사용을 위해 추가
-#include "log.h"
+#include "security.h"
+#include "log.h"       // 기존 로그 (LOGW 등)
+#include "debug.h"     // [추가] 정밀 시간 측정을 위한 커스텀 디버그 모듈
 #include "timeutil.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -16,7 +17,7 @@ typedef struct {
   uint32_t msg_id;
   uint64_t sent_ms;
   int retry;
-  tx_cmd_wired_t *cmd; // [수정] tx_cmd_t -> tx_cmd_wired_t (타입명 변경 반영)
+  tx_cmd_wired_t *cmd;
 } pending_t;
 
 static int tcp_connect_bind(const app_config_t *cfg) {
@@ -49,6 +50,9 @@ static int tcp_connect_bind(const app_config_t *cfg) {
     close(s);
     return -1;
   }
+  
+  // [DEBUG] 연결 성공 시점 기록
+  DBG_INFO("TCP Connected to Server %s:%d", cfg->server_ip, cfg->server_port);
   return s;
 }
 
@@ -70,11 +74,16 @@ static void* tcp_rx_thread(void *arg) {
 
         if (n != sizeof(rsu3_packet_t)) continue;
 
+        // [DEBUG] 서버로부터 데이터 수신 완료 시점 (RX Start)
+        DBG_INFO("[RX] RSU-3 Packet received (%ld bytes)", n);
+
         const rsu3_packet_t *pkt = (rsu3_packet_t*)buf;
         
         // [RX Strip] RSU-3 -> RSU-3'
         rsu3_payload_t *payload = (rsu3_payload_t*)calloc(1, sizeof(rsu3_payload_t));
         if (sec_wired_rx_strip(pkt, payload)) {
+            // [DEBUG] 큐에 넣기 직전
+            DBG_INFO("[RX] Pushing RSU-3 Payload to Queue");
             bq_push(wc->rsu3_out_q, payload);
         } else {
             free(payload);
@@ -87,7 +96,7 @@ static void* tcp_rx_thread(void *arg) {
 static void* tcp_tx_manager_thread(void *arg) {
     wired_client_t *wc = (wired_client_t*)arg;
 
-    // pending 로직은 간단히 유지 (ACK 처리는 일단 스텁)
+    // pending 로직은 간단히 유지
     pending_t pend[64];
     memset(pend, 0, sizeof(pend));
 
@@ -99,13 +108,22 @@ static void* tcp_tx_manager_thread(void *arg) {
             continue;
         }
 
+        // [DEBUG] 큐에서 데이터를 꺼낸 시점 (StateManager -> WiredClient 이동 시간 확인용)
+        DBG_INFO("[TX] Pop cmd from Queue. Addr: %p", cmd);
+
         if (cmd->rsu2p) {
             // [TX Wrap] RSU-2' -> RSU-2
             rsu2_packet_t pkt;
             memset(&pkt, 0, sizeof(pkt));
             
             if (sec_wired_tx_wrap(cmd->rsu2p, &pkt)) {
+                // [DEBUG] 소켓 전송 시작 (시스템 콜 호출 직전)
+                DBG_INFO("[TX] Calling send() ... Size: %lu", sizeof(pkt));
+                
                 send(wc->sock, &pkt, sizeof(pkt), 0);
+                
+                // [DEBUG] 소켓 전송 완료 (커널 버퍼 복사 완료)
+                DBG_INFO("[TX] send() Return (Sent to Kernel Buffer)");
             }
             free(cmd->rsu2p);
         }

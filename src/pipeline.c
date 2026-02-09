@@ -9,6 +9,7 @@
 #include "filter.h"
 #include "security.h"
 #include "packet.h"
+#include "debug.h"
 
 // WL-1 Worker: [Raw Q] -> [Filter] -> [Strip] -> [Packet Conv] -> [SM Event Q]
 static void* wl1_worker_thread(void *arg) {
@@ -19,6 +20,7 @@ static void* wl1_worker_thread(void *arg) {
         if (!pkt) break;
 
         uint32_t dist = 0;
+        DBG_INFO("[STEP 2] Worker Pop. Addr: %p", pkt);
         // 1. Filter (Raw Packet 검사)
         if (!filter_pass_all(pkt, p->cfg.rsu_id, &dist)) {
             free(pkt);
@@ -44,6 +46,7 @@ static void* wl1_worker_thread(void *arg) {
         sm_event_t *ev = calloc(1, sizeof(sm_event_t));
         ev->type = EV_WL1_RX;
         ev->u.rsu2p = rsu2p;
+        DBG_INFO("[STEP 3] Push to SM Queue");
         bq_push(&p->Q_sm_events, ev);
 
         free(pkt);

@@ -8,7 +8,7 @@ static bool light_pass(const wl1_packet_t *pkt) {
   if (pkt->payload.header.msg_type == 0x01) return false;
 
   // 2) ttl!=1 이면 drop
-  if (pkt->payload.header.ttl != 1) return false;
+  if (pkt->payload.header.ttl != 3) return false;
 
   // 3) header version 체크 (예: 1)
   if (pkt->payload.header.version != 1) return false;
