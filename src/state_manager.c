@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "log.h"
 #include "types.h"
@@ -9,7 +10,7 @@
 #include "packet.h"
 #include "security.h" 
 
-// ---- 사고 테이블(간단 버전) ----
+// ---- 사고 테이블 ----
 typedef struct {
   uint64_t accident_id;     
   bool active;
@@ -17,7 +18,7 @@ typedef struct {
   rsu3_payload_t last_rsu3; 
 } acc_ent_t;
 
-// ---- 2초 tick 이벤트를 SM 큐로 넣는 타이머 콜백 ----
+// ---- 2초 tick 이벤트 ----
 static void post_tick_event(void *arg) {
   bq_t *q = (bq_t*)arg;
   sm_event_t *ev = (sm_event_t*)calloc(1, sizeof(*ev));
@@ -27,7 +28,6 @@ static void post_tick_event(void *arg) {
 }
 
 static void schedule_next_2s(scheduler_t *sched, bq_t *evq) {
-  // 2초마다 tick
   (void)scheduler_add(sched, now_ms_monotonic() + 2000, post_tick_event, evq);
 }
 
@@ -39,7 +39,6 @@ static void* sm_thread(void *arg) {
   memset(table, 0, sizeof(table));
   int n = 0;
 
-  // 최초 tick 예약
   schedule_next_2s(sm->sched, sm->in_ev_q);
 
   while (sm->running) {
@@ -48,11 +47,11 @@ static void* sm_thread(void *arg) {
 
     uint64_t now = now_ms_monotonic();
 
-    // 1. [WL-1 수신] -> 중복 검사 -> (통과 시) 서버 전송
+    // 1. [WL-1 수신] 차량 사고 보고 -> LED 즉시 점등
     if (ev->type == EV_WL1_RX) {
-      rsu2_payload_t *p = ev->u.rsu2p; // Packet Convert에서 이미 변환된 Payload
+      rsu2_payload_t *p = ev->u.rsu2p;
 
-      // (1) 테이블 검색
+      // (1) 중복 검색
       int idx = -1;
       for (int i = 0; i < n; i++) {
         if (table[i].accident_id == p->accident.accident_id) { 
@@ -61,14 +60,12 @@ static void* sm_thread(void *arg) {
         }
       }
 
-      // (2) 이미 알고 있고, 만료되지 않은(Active) 사고라면 -> 서버 전송 건너뜀 (DROP)
-      if (idx >= 0 && table[idx].active && now < table[idx].expire_ms) {
-          // LOGI("Duplicate accident report ignored (ID: %llx)", (long long)p->accident.accident_id);
-          free(p); // 메모리 해제
+      // (2) 이미 알고 있는 Active 사고 -> 무시
+      if (idx >= 0 && table[idx].active) {
+          free(p); 
       } 
-      // (3) 새로운 사고라면 -> 테이블 등록 & 서버 전송
+      // (3) 새로운 사고 -> 등록 & LED ON & 서버 전송
       else {
-          // 테이블 공간이 남으면 등록
           if (idx < 0 && n < 256) {
               idx = n++;
               table[idx].accident_id = p->accident.accident_id;
@@ -76,11 +73,16 @@ static void* sm_thread(void *arg) {
           
           if (idx >= 0) {
               table[idx].active = true;
-              table[idx].expire_ms = now + 15000; // 15초간 중복 방지
-              // last_rsu3는 아직 없음 (서버 응답 대기)
+              table[idx].expire_ms = UINT64_MAX;
+              
+              // [핵심 수정] 사고 인지 즉시 LED 켜기!
+              if (sm->led) {
+                  led_set(sm->led, true);
+                  LOGI("!! EMERGENCY !! Accident Detected -> LED ON");
+              }
           }
 
-          // 서버 전송 큐로 전달
+          // 서버 전송
           tx_cmd_wired_t *cmd = (tx_cmd_wired_t*)calloc(1, sizeof(*cmd)); 
           if (cmd) {
             cmd->rsu2p = p; 
@@ -91,7 +93,7 @@ static void* sm_thread(void *arg) {
           }
       }
     }
-    // 2. [서버(RSU-3) 수신] -> RSU-3' -> 사고 테이블 갱신
+    // 2. [서버(RSU-3) 수신] -> 상태 동기화
     else if (ev->type == EV_RSU3_RX) {
       rsu3_payload_t *r = ev->u.rsu3p;
 
@@ -100,47 +102,49 @@ static void* sm_thread(void *arg) {
         if (table[i].accident_id == r->accident.accident_id) { idx = i; break; }
       }
       
-      // 서버가 먼저 알려준 경우에도 등록
       if (idx < 0 && n < 256) {
         idx = n++;
         table[idx].accident_id = r->accident.accident_id;
       }
 
       if (idx >= 0) {
-        table[idx].active = (r->server_info.acc_flag != 0);
-        table[idx].expire_ms = now + 15000; 
+        bool is_alarm_on = (r->server_info.acc_flag != 0);
+
+        table[idx].active = is_alarm_on;
+        table[idx].expire_ms = UINT64_MAX; 
         table[idx].last_rsu3 = *r;          
 
+        // 서버 정보에 따라 LED 상태 갱신
         if (sm->led) {
           bool any_active = false;
           for (int i = 0; i < n; i++) if (table[i].active) { any_active = true; break; }
           (void)led_set(sm->led, any_active);
+          LOGI("Server update -> LED %s", any_active ? "ON" : "OFF");
         }
       }
       free(r);
     }
-    // 3. [2초 타이머] -> Active 사고 무선 송신 (WL-1/RSU-1)
+    // 3. [2초 타이머] -> 주기적 전파 및 LED 상태 유지
     else if (ev->type == EV_TIMER_TICK) {
+      
+      // LOGI("[Alive] State Manager Tick..."); // 생존 확인용 (필요시 주석 해제)
+
       bool any_active = false;
       for (int i = 0; i < n; i++) {
         if (!table[i].active) continue;
 
         if (now > table[i].expire_ms) {
           table[i].active = false;
+          LOGI("Accident ID %llx expired.", (long long)table[i].accident_id);
           continue;
         }
         any_active = true;
 
-        // RSU-3 정보가 있어야 전파 가능 (서버 승인 패킷 기반 조립)
         if (table[i].last_rsu3.rsu_id == 0) continue; 
 
-        // 3-1. RSU-3' -> WL-1' (Payload 변환)
         wl1_payload_t wl1p;
-        if (!packet_rsu3_to_wl1(&table[i].last_rsu3, &wl1p)) {
-          continue;
-        }
+        if (!packet_rsu3_to_wl1(&table[i].last_rsu3, &wl1p)) continue;
 
-        // 3-2. WL-1' -> WL-1 Packet (보안 Wrap)
         wl1_packet_t *pkt = (wl1_packet_t*)calloc(1, sizeof(wl1_packet_t));
         if (!pkt) continue;
 
@@ -148,17 +152,13 @@ static void* sm_thread(void *arg) {
             free(pkt);
             continue;
         }
-
         (void)bq_push(sm->to_air_q, pkt);
       }
 
-      // 다음 tick 예약
       schedule_next_2s(sm->sched, sm->in_ev_q);
-
-      // LED 상태 재평가
-      if (sm->led) {
-        (void)led_set(sm->led, any_active);
-      }
+      
+      // 주기적으로 LED 상태 재확인 (혹시 꺼졌을까봐)
+      if (sm->led) (void)led_set(sm->led, any_active);
     }
 
     free(ev);

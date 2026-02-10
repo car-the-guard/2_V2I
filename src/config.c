@@ -16,7 +16,7 @@ int load_default_config(app_config_t *cfg) {
   cfg->server_port = 20615;
   cfg->local_port = 20905;  // RSU가 사용할 포트
 
-  cfg->gpiochip = "gpioa";
-  cfg->led_line = 17;
+  cfg->gpiochip = "gpiochip2";
+  cfg->led_line = 22;
   return 0;
 }
