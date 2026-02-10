@@ -72,9 +72,9 @@ typedef struct {
 
 // [3. RSU-3] Server -> RSU
 typedef struct {
-    uint64_t server_tx_time;
-    uint16_t period_sec;
-    uint16_t acc_flag;    // On/Off
+    uint16_t distance;      // (서버가 보낸 원본 값 그대로 돌려줌)
+    uint16_t acc_flag;      // On:0x0000, Off:0xFFFF (서버가 수정한 값)
+    uint64_t rsu_rx_time;   // (서버가 보낸 원본 값 그대로 돌려줌)
 } rsu3_info_t;
 
 // RSU-3 Payload (48 Bytes)
