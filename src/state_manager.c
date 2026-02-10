@@ -63,6 +63,8 @@ static void* sm_thread(void *arg) {
       // (2) 이미 알고 있는 Active 사고 -> 무시
       if (idx >= 0 && table[idx].active) {
           free(p); 
+          // [LOG] 중복이라 무시됨 (디버깅용)
+          // LOGD("Duplicate accident ignored locally");
       } 
       // (3) 새로운 사고 -> 등록 & LED ON & 서버 전송
       else {
@@ -73,9 +75,8 @@ static void* sm_thread(void *arg) {
           
           if (idx >= 0) {
               table[idx].active = true;
-              table[idx].expire_ms = UINT64_MAX;
+              table[idx].expire_ms = UINT64_MAX; // 영구 유지
               
-              // [핵심 수정] 사고 인지 즉시 LED 켜기!
               if (sm->led) {
                   led_set(sm->led, true);
                   LOGI("!! EMERGENCY !! Accident Detected -> LED ON");
@@ -102,42 +103,46 @@ static void* sm_thread(void *arg) {
         if (table[i].accident_id == r->accident.accident_id) { idx = i; break; }
       }
       
+      // 혹시 서버가 먼저 알려준 경우 등록
       if (idx < 0 && n < 256) {
         idx = n++;
         table[idx].accident_id = r->accident.accident_id;
       }
 
       if (idx >= 0) {
-        bool is_alarm_on = (r->server_info.acc_flag != 0);
+        // [수정된 부분] 서버 Protocol: 0x0000(0) == ON, 0xFFFF == OFF
+        bool is_alarm_on = (r->server_info.acc_flag == 0);
 
+        // 상태 업데이트
         table[idx].active = is_alarm_on;
         table[idx].expire_ms = UINT64_MAX; 
         table[idx].last_rsu3 = *r;          
 
-        // 서버 정보에 따라 LED 상태 갱신
+        // 전체 테이블 검사 후 LED 갱신
         if (sm->led) {
           bool any_active = false;
-          for (int i = 0; i < n; i++) if (table[i].active) { any_active = true; break; }
+          for (int i = 0; i < n; i++) {
+              if (table[i].active) { 
+                  any_active = true; 
+                  break; 
+              }
+          }
           (void)led_set(sm->led, any_active);
-          LOGI("Server update -> LED %s", any_active ? "ON" : "OFF");
+          
+          if (is_alarm_on) {
+            LOGI("Server Confirmed ON (Ack) -> LED Keeping ON");
+          } else {
+            LOGI("Server Command OFF -> LED OFF");
+          }
         }
       }
       free(r);
     }
-    // 3. [2초 타이머] -> 주기적 전파 및 LED 상태 유지
+    // 3. [2초 타이머] -> 주기적 전파
     else if (ev->type == EV_TIMER_TICK) {
-      
-      // LOGI("[Alive] State Manager Tick..."); // 생존 확인용 (필요시 주석 해제)
-
       bool any_active = false;
       for (int i = 0; i < n; i++) {
         if (!table[i].active) continue;
-
-        if (now > table[i].expire_ms) {
-          table[i].active = false;
-          LOGI("Accident ID %llx expired.", (long long)table[i].accident_id);
-          continue;
-        }
         any_active = true;
 
         if (table[i].last_rsu3.rsu_id == 0) continue; 
@@ -157,7 +162,7 @@ static void* sm_thread(void *arg) {
 
       schedule_next_2s(sm->sched, sm->in_ev_q);
       
-      // 주기적으로 LED 상태 재확인 (혹시 꺼졌을까봐)
+      // LED 상태 강제 동기화 (안전장치)
       if (sm->led) (void)led_set(sm->led, any_active);
     }
 
